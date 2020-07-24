@@ -18,19 +18,27 @@ library(mgcv)
 
 #setwd("")
 
+source("./utility.R")
+odh_data <- get_merged_ODRS_region(
+  data_url = "https://coronavirus.ohio.gov/static/COVIDSummaryData.csv",
+  backup_data_file = NULL,
+  last_update_date = "auto"
+)
+
+odh_df <- agg_daily_counts_by_cols(
+  data = odh_data,
+  group_col = "County",
+  date_col = "Onset Date",
+  last_update_date = "auto",
+  evenly_space = TRUE
+)
+
 df <- readOGR("ohiocounty",layer = "ohio.county") 
 
 county <- read_csv("county_info.csv")
 
-odh_data <- read.csv(url("https://coronavirus.ohio.gov/static/COVIDSummaryData.csv"))
-odh_data <- odh_data[-nrow(odh_data),]
-names(odh_data)[1] <- "County"
-odh_data$Case.Count <- as.numeric(odh_data$Case.Count)
-
-odh_df <- aggregate(Case.Count ~ County + Onset.Date, data = odh_data, sum)
-
+names(odh_df) <- c("Onset.Date","County","Case.Count")
 odh_df <- odh_df %>%
-  mutate(Onset.Date = as.Date(Onset.Date, format = "%m/%d/%Y")) %>%
   filter(Onset.Date >= as.Date("2020-03-01")) %>%
   rename(Date = Onset.Date) %>%
   complete(Date = seq.Date(min(Date), max(Date), by = "day"),County) %>%
@@ -47,370 +55,7 @@ county_data <- odh_df %>%
          NAME = County,
          rate = Daily_new/Population)
 
-county_data.zone1 <- county_data %>% 
- filter(Zone %in% 1)
-county.region1 <- county_data.zone1 %>%
- filter(Region %in% 1)
-county_data.region2 <- county_data.zone1 %>%
- filter(Region %in% 2)
-county_data.region5 <- county_data.zone1 %>%
- filter(Region %in% 5)
-county_data.zone2 <- county_data %>% 
- filter(Zone %in% 2)
-county_data.region4 <- county_data.zone2 %>%
- filter(Region %in% 4)
-county_data.region7 <- county_data.zone2 %>%
- filter(Region %in% 7)
-county_data.region8 <- county_data.zone2 %>%
- filter(Region %in% 8)
-county_data.zone3 <- county_data %>% 
- filter(Zone %in% 3)
-county_data.region3 <- county_data.zone3 %>%
- filter(Region %in% 3)
-county_data.region6 <- county_data.zone3 %>%
- filter(Region %in% 6)
-
 data <- county_data
-
-##===================================================##
-
-############### insert Patrick's model ################
-
-##===================================================##
-construct.focus.dataset <- function(
-  data,
-  aggregation.variable = "State",
-  aggregation.level = "OH",
-  focus.variable = "State",
-  focus.levels = c("OH"),
-  leave.focus.out = TRUE) {
-  
-  # check for existence of variables in dataset
-  if (!(aggregation.variable %in% colnames(data))) {
-    stop("Aggregation variable `", aggregation.variable, "`` not in data.")
-  }
-  if (!(focus.variable %in% colnames(data))) {
-    stop("Focus variable `", focus.variable, "` not in data.")
-  }
-  if (!("Daily_new" %in% colnames(data))) {
-    stop("Outcome variable `Daily_new`` not in data.")
-  }
-  if (!("Population" %in% colnames(data))) {
-    stop("Normalization variable `Population`` not in data.")
-  }
-  
-  data.universe <- data %>%
-    filter(get(aggregation.variable) == aggregation.level)
-  
-  if (nrow(data.universe) == 0) {
-    stop("No rows matching `",
-         aggregation.variable, " == '", aggregation.level,
-         "'` in data.")
-  }
-  
-  ### standardization ###
-  
-  if (leave.focus.out) {
-    data.comparator <- data.universe %>%
-      filter(!(get(focus.variable) %in% focus.levels))
-  } else {
-    data.comparator <- data.universe
-  }
-  
-  data.agg.Daily_new <- data.comparator %>%
-    group_by(Date) %>%
-    summarize(agg_Daily_new = sum(Daily_new)) %>%
-    ungroup()
-  
-  
-  agg.Population <- data.comparator %>%
-    distinct(County, .keep_all = TRUE) %>%
-    pull(Population) %>% sum(na.rm = TRUE)
-  
-  data.focus <- data.universe %>%
-    filter(get(focus.variable) %in% focus.levels) %>%
-    group_by(Date) %>%
-    summarize(focus_Population = sum(Population, na.rm = TRUE),
-              focus_Daily_new = sum(Daily_new)) %>%
-    left_join(data.agg.Daily_new, by = "Date") %>%
-    mutate(agg_Population = agg.Population,
-           Expected = focus_Population * (agg_Daily_new / agg_Population),
-           Crude_rr = focus_Daily_new / Expected,
-           Rel_Date = as.numeric(Date - min(Date)))
-  
-  if (nrow(data.focus) == 0) {
-    stop("No rows matching `",
-         focus.variable, " %in% c('",
-         paste(focus.levels, collapse = "', '"),
-         "')` in data.")
-  }
-  
-  data.focus
-}
-
-test.rr.positive <- function(
-  data,
-  aggregation.variable = "State",
-  aggregation.level = "OH",
-  focus.variable = "County",
-  focus.levels = c("Franklin"),
-  leave.focus.out = TRUE
-) {
-  
-  data.focus <- construct.focus.dataset(
-    data = data,
-    aggregation.variable = aggregation.variable,
-    aggregation.level = aggregation.level,
-    focus.variable = focus.variable,
-    focus.levels = focus.levels,
-    leave.focus.out = leave.focus.out
-  )
-  
-  fit <- tryCatch({
-    gam(focus_Daily_new ~ 1 + offset(log(Expected)) + s(Rel_Date),
-        family = nb(),
-        data = data.focus %>% mutate(
-          Expected = if_else(Expected == 0, 1 / 100, Expected)))
-  }, error = function(cond) {
-    gam(Daily_new ~ 1 + offset(log(Expected)) + Rel.Date,
-        family = nb(),
-        data = data.focus %>% mutate(
-          Expected = if_else(Expected == 0, 1 / 100, Expected)))
-  })
-  
-  newdata <- data.focus
-  newdata$Expected[newdata$Expected == 0] <- 1 / 100
-  
-  pred <- predict(fit, newdata = newdata, type = "link", se.fit = TRUE)
-  
-  pred$fit <- pred$fit - log(newdata$Expected)
-  
-  last <- length(pred$fit)
-  ci <- exp(pred$fit[last] + qnorm(c(0.025, 0.975)) * pred$se.fit[last])
-  prob.rr.gt.1 <- pnorm(pred$fit[last] / pred$se.fit[last])
-  
-  rel.risk <- c(
-    "Estimate" = unname(log2(exp(pred$fit[last]))),
-    "2.5%" = log2(ci[1]),
-    "97.5%" = log2(ci[2]),
-    "Post prob pos" = unname(prob.rr.gt.1)
-  )
-  
-  
-  Xp <- predict(fit, newdata = newdata, type = "lpmatrix")
-  a <- c(rep(0, nrow(Xp) - 2), c(-1, 1))
-  Xs <- t(a) %*% Xp
-  fdiff <- drop(Xs %*% coef(fit))
-  var.fdiff <- drop(Xs %*% fit$Vp %*% t(Xs))
-  se.fdiff <- sqrt(var.fdiff)
-  ci <- exp(fdiff + qnorm(c(0.025, 0.975)) * se.fdiff)
-  prob.fdiff.gt.1 <- pnorm(fdiff / se.fdiff)
-  
-  rr.trend <- c(
-    "Estimate" = unname(log2(exp(fdiff))),
-    "2.5%" = log2(ci[1]),
-    "97.5%" = log2(ci[2]),
-    "Post prob pos" = unname(prob.fdiff.gt.1)
-  )
-  
-  rbind(
-    "Log2 rel risk" = rel.risk,
-    "Deriv log2 rel risk" = rr.trend
-  )
-}
-
-
-ggplot.local.trend <-
-  function(data,
-           aggregation.variable = "State",
-           aggregation.level = "OH",
-           focus.variable = "State",
-           focus.levels = c("OH"),
-           log.scale = TRUE,
-           rel.risk = TRUE,
-           leave.focus.out = TRUE,
-           title = NULL,
-           confint = TRUE) {
-    
-    data.focus <- construct.focus.dataset(
-      data = data,
-      aggregation.variable = aggregation.variable,
-      aggregation.level = aggregation.level,
-      focus.variable = focus.variable,
-      focus.levels = focus.levels,
-      leave.focus.out = leave.focus.out
-    )
-    
-    ### model fit ###
-    
-    if (rel.risk) {
-      fit <- tryCatch({
-        gam(focus_Daily_new ~ 1 + offset(log(Expected)) + s(Rel_Date),
-            family = nb(),
-            data = data.focus %>% mutate(
-              Expected = if_else(Expected == 0, 1 / 100, Expected)))
-      }, error = function(cond) {
-        gam(Daily_new ~ 1 + offset(log(Expected)) + Rel.Date,
-            family = nb(),
-            data = data.focus %>% mutate(
-              Expected = if_else(Expected == 0, 1 / 100, Expected)))
-      })
-      
-      spred <- predict(fit,
-                       newdata = data.focus %>% mutate(
-                         Expected = if_else(Expected == 0, 1 / 100, Expected)
-                       ),
-                       type = "response")
-      
-      p <- predict(fit,
-                   newdata = data.focus %>% mutate(
-                     Expected = if_else(Expected == 0, 1 / 100, Expected)
-                   ),
-                   type = "link",
-                   se.fit = TRUE)
-      upper <- fit$family$linkinv(p$fit + qnorm(0.975) * p$se.fit)
-      lower <- fit$family$linkinv(p$fit + qnorm(0.025) * p$se.fit)
-    } else { # raw counts
-      fit <- tryCatch({
-        gam(focus_Daily_new ~ 1 + s(Rel_Date),
-            family = nb(),
-            data = data.focus)
-      }, error = function(cond) {
-        gam(Daily_new ~ 1 + Rel.Date,
-            family = nb(),
-            data = data.focus)
-      })
-      
-      spred <- predict(fit, type = "response")
-      
-      p <- predict(fit, type = "link", se.fit = TRUE)
-      upper <- fit$family$linkinv(p$fit + qnorm(0.975) * p$se.fit)
-      lower <- fit$family$linkinv(p$fit + qnorm(0.025) * p$se.fit)
-    }
-    
-    ### plotting ###
-    
-    if (is.null(title)) {
-      plot.title <- paste0(
-        "",
-        focus.variable,
-        " = ",
-        paste(focus.levels, collapse = ", "),
-        ifelse(rel.risk,
-               paste0(
-                 "\nversus ",
-                 ifelse(leave.focus.out, "everything else in ", ""),
-                 aggregation.variable,
-                 " = ",
-                 aggregation.level
-               ),
-               ""
-        )
-      )
-    } else {
-      plot.title = title
-    }
-    
-    
-    # plotting options
-    if (rel.risk) {
-      
-      plot.data <- data.focus %>% select(Date, focus_Daily_new, Expected, Crude_rr) %>%
-        mutate(
-          expected.filled = if_else(Expected == 0, 1 / 100, Expected)
-        )
-      
-      plot.data$predicted <- spred
-      plot.data$upper <- upper
-      plot.data$lower <- lower
-      
-      transform <- ifelse(log.scale, log2, identity)
-      
-      p <- ggplot(plot.data, aes(x = Date, y = transform(Crude_rr))) +
-        geom_point() +
-        geom_line(aes(y = transform(predicted / expected.filled)), color = "dodgerblue4", size = 1.2) +
-        xlab("Date") +
-        ylab(ifelse(log.scale, "Log2 relative risk", "Relative risk")) +
-        ggtitle(plot.title) +
-        theme_minimal() + 
-        geom_hline(yintercept = transform(1), linetype = "dashed")
-      
-      if (confint) {
-        p <- p + geom_ribbon(aes(ymax = transform(upper / expected.filled),
-                                 ymin = transform(lower / expected.filled)),
-                             alpha = 0.3,
-                             fill = "dodgerblue3")
-      }
-      
-      p
-      
-    } else { # plotting raw counts
-      
-      plot.data <- data.focus %>% select(Date, focus_Daily_new, Expected, Crude_rr) %>%
-        mutate(
-          expected.filled = if_else(Expected == 0, 1 / 100, Expected)
-        )
-      
-      plot.data$predicted <- spred
-      plot.data$upper <- upper
-      plot.data$lower <- lower
-      
-      p <- ggplot(plot.data, aes(x = Date, y = focus_Daily_new)) +
-        geom_point() +
-        geom_line(aes(y = predicted),color = "dodgerblue4", size = 1.2) +
-        scale_y_continuous(trans = if_else(log.scale, expr(log10()), expr(identity()))) +
-        xlab("Date") +
-        ylab(ifelse(log.scale, "Daily new count (log scale)", "Daily new count")) +
-        theme_minimal() + 
-        ggtitle(plot.title)
-      
-      if (confint) {
-        p <- p + geom_ribbon(aes(ymax = upper,
-                                 ymin = lower),
-                             alpha = 0.3,
-                             fill = "dodgerblue3")
-      }
-      
-      p
-    }
-  }
-
-screen <- function(
-  data,
-  aggregation.variable = "State",
-  aggregation.level = "OH",
-  focus.variable = "County",
-  leave.focus.out = TRUE
-) {
-  focus.levels <- data %>%
-    filter(get(aggregation.variable) == aggregation.level) %>%
-    pull(get(focus.variable)) %>%
-    unique()
-  
-  summary <- array(NA, dim = c(length(focus.levels), 2, 4))
-  dimnames(summary) <- list(focus.variable = focus.levels,
-                            "Summary" = c("Log2 rel risk",
-                                          "Deriv log2 rel risk"),
-                            "Quantity" = c("Estimate",
-                                           "2.5%", "97.5%",
-                                           "Post prob pos"))
-  
-  
-  
-  
-  for (focus.level in focus.levels) {
-    test <- test.rr.positive(data,
-                             aggregation.variable = aggregation.variable,
-                             aggregation.level = aggregation.level,
-                             focus.variable = focus.variable,
-                             focus.levels = focus.level,
-                             leave.focus.out = TRUE)
-    
-    summary[focus.level, , ] <- test
-  }
-  
-  summary
-}
 
 test.counties <- screen(data,
                         aggregation.variable = "State",
@@ -458,24 +103,82 @@ ui <- fluidPage(
       #          multiple = FALSE),
       #selectInput("View", "Counties", choices = unique(data$County), multiple = TRUE),
       #selectInput("AggregateVariable", "Aggregate Area Variable", 
-                 # choices = c("region","Zone","State")),
-      selectizeInput("AggregateVariable", "Aggregate Variable:", 
-                     choices = c("State", "Zone","Region"),
-                     selected = "State"),
-      
-      selectizeInput("AggregateLevel", "Aggregate Level:", 
-                     choices = c("OH", "1", "2", "3", "4", "5", "6", "7", "8"),
-                     selected = "OH"),
-      selectizeInput("View", "County:", 
-                     choices =unique(data$County), 
-                     selected= "Franklin", multiple = TRUE),
-      
+                 # choices = c("region","Zone","State")),  
       sliderInput("date_select","Date:",
                   min = as.Date("2020-03-01"),
                   max = max(county_data$Date),
                   value = max(county_data$Date),
                   timeFormat = "%m/%d",
                   animate = TRUE),
+      hr(),
+      selectizeInput("AggregateVariable", "Aggregate Variable:", 
+                     choices = c("State", "Zone","Region"),
+                     selected = "State"),
+      
+      conditionalPanel(
+        condition = "input.AggregateVariable == 'State'",
+        selectizeInput(
+          inputId = "AggregateLevel_state",
+          label = "Aggregate Level",
+          choices = c("Ohio" = "OH"),
+          selected = c("Ohio" = "OH")
+        )
+      ),
+      
+      conditionalPanel(
+        condition = "input.AggregateVariable == 'Zone'",
+        selectizeInput(
+          inputId = "AggregateLevel_zone",
+          label = "Aggregate Level",
+          choices = c("1","2","3"),
+          selected = "1"
+        )
+      ),
+      
+      conditionalPanel(
+        condition = "input.AggregateVariable == 'Region'",
+        selectizeInput(
+          inputId = "AggregateLevel_region",
+          label = "Aggregate Level",
+          choices = c("1","2","3","4","5","6","7","8"),
+          selected = "1"
+        )
+      ),
+      
+      fluidRow(
+        column(
+          width = 10,
+          offset = 0,
+          # style = "padding: 0px",
+          selectizeInput(
+            inputId = "View",
+            label = "Select County(ies)",
+            choices = unique(data$County),
+            selected = "Franklin",
+            multiple = TRUE,
+            options = list(
+              hideSelected = FALSE
+            )
+          ),
+        ),
+        column(
+          width = 2,
+          offset = 0,
+          style = "margin-top: 27px; padding: 0px",
+          actionBttn(
+            inputId = "run_RR",
+            label = NULL,
+            icon = icon("arrow-alt-circle-right"),
+            style = "unite",
+            color = "primary",
+            block = FALSE,
+            no_outline = TRUE,
+            size = "xs"
+          )
+        )
+      ),
+      
+
       hr(),
       checkboxInput("LogScale", "Log Scale", value = F),
       checkboxInput("confint", "Confidence band", value = T),
@@ -500,100 +203,19 @@ ui <- fluidPage(
 
 
 server <- function(input, output, session) {
-  observe({
-    av <- input$AggregateVariable
-    if(av == "State"){
-      updateSelectizeInput(session, "AggregateLevel",
-                           choices = "OH",
-                           selected = "OH"
-      )
-    }
-    if(av == "Zone"){
-      updateSelectizeInput(session, "AggregateLevel",
-                           choices = c("1","2","3"),
-                           selected = "1"
-      )
-    }
-    if (av == "Region"){
-      updateSelectizeInput(session, "AggregateLevel",
-                           choices = c("1", "2", "3", "4", "5", "6", "7", "8"),
-                           selected = "4"
-      )
-    }
-    
-  })
   
+  # ------- Diable the run button when there is no values specified in regions/counties
   observe({
-    req(input$AggregateVariable)
-    req(input$AggregateLevel)
-    av <- input$AggregateVariable
-    region <- input$AggregateLevel
-    if (region == "OH"){
-      updateSelectizeInput(session,"View",
-                           choices =unique(county_data$County), 
-                           selected="Franklin")
-    }
-    if (av == "Zone" & region == "1"){
-      updateSelectizeInput(session,"View",
-                           choices =unique(county_data.zone1$County), 
-                           selected="Cuyahoga")
-    }
-    if (av == "Zone" & region == "2"){
-      updateSelectizeInput(session,"View",
-                           choices =unique(county_data.zone2$County), 
-                           selected="Franklin")
-    }
-    if (av == "Zone" & region == "3"){
-      updateSelectizeInput(session,"View",
-                           choices =unique(county_data.zone3$County), 
-                           selected="Hamilton")
-    }
-    if (av == "Region" & region == "1"){
-      updateSelectizeInput(session,"View",
-                           choices =unique(county_data.region1$County), 
-                           selected="Lucas")
-    }
-    if (av == "Region" & region == "2"){
-      updateSelectizeInput(session,"View",
-                           choices =unique(county_data.region2$County), 
-                           selected="Cuyahoga")
-    }
-    if (av == "Region" & region == "3"){
-      updateSelectizeInput(session,"View",
-                           choices =unique(county_data.region3$County), 
-                           selected="Montgomery")
-    }
-    if (av == "Region" & region == "4"){
-      updateSelectizeInput(session,"View",
-                           choices =unique(county_data.region4$County), 
-                           selected="Franklin")
-    }
-    if (av == "Region" & region == "5"){
-      updateSelectizeInput(session,"View",
-                           choices =unique(county_data.region5$County), 
-                           selected="Summit")
-    }
-    if (av == "Region" & region == "6"){
-      updateSelectizeInput(session,"View",
-                           choices =unique(county_data.region6$County), 
-                           selected="Hamilton")
-    }
-    if (av == "Region" & region == "7"){
-      updateSelectizeInput(session,"View",
-                           choices =unique(county_data.region7$County), 
-                           selected="Hocking")
-    }
-    if (av == "Region" & region == "8"){
-      updateSelectizeInput(session,"View",
-                           choices =unique(county_data.region8$County), 
-                           selected="Belmont")
+    shinyjs::enable(id = "run_RR")
+    if (is.null(input$View)) {
+      shinyjs::disable(id = "run_RR")
+    } else {
+      shinyjs::enable(id = "run_RR")
     }
   })
   
   
-  # create function with selected counties
   OH_map_db = reactive({
-    req(input$View)
     req(input$date_select)
     db = county_data
     db <- db %>% 
@@ -604,53 +226,11 @@ server <- function(input, output, session) {
     db_map@data <- db_map_df
     db_map
   })
-
+  
   
   output$OHmap <- renderLeaflet({
-    selected_county = county_data %>%
-      filter(County %in% input$View)
     bins <- c(0,1,10,20,30,40,50,3000)
     legend <- c("0","1-10","10-20","20-30","30-40","40-50",">50")
-    # label format
-    mylabelFormat <-function(
-      prefix = "", suffix = "", between = " &ndash; ", digits = 3, big.mark = ",",
-      transform = identity
-    ) {
-      
-      formatNum <- function(x) {
-        format(
-          round(transform(x), digits), trim = TRUE, scientific = FALSE,
-          big.mark = big.mark
-        )
-      }
-      
-      function(type, ...) {
-        switch(
-          type,
-          numeric = (function(cuts) {
-            paste0(prefix, formatNum(cuts), suffix)
-          })(...), # nolint
-          bin = (function(cuts) {
-            n <- length(cuts)
-            prefix
-          })(...), # nolint
-          quantile = (function(cuts, p) {
-            n <- length(cuts)
-            p <- paste0(round(p * 100), "%")
-            cuts <- paste0(formatNum(cuts[-n]), between, formatNum(cuts[-1]))
-            # mouse over the legend labels to see the values (quantiles)
-            paste0(
-              "<span title=\"", cuts, "\">", prefix, p[-n], between, p[-1], suffix,
-              "</span>"
-            )
-          })(...), # nolint
-          factor = (function(cuts) {
-            paste0(prefix, as.character(transform(cuts)), suffix)
-          })(...) # nolint
-        )
-      }
-      
-    }
     
     ## leaflet
     ## define color 
@@ -660,8 +240,8 @@ server <- function(input, output, session) {
     pal2 <- colorFactor(palette = c('white','yellow','orange','red'),ohio.county$Flag)
     
     # zoom level
-    if (length(unique(OH_map_db()$County)) == 1){zoom = 10} else{zoom = 7.5}
-
+    #if (length(unique(OH_map_db()$County)) == 1){zoom = 10} else{zoom = 7.5}
+    
     leaflet() %>%
       #st_transform(crs = "+init=epsg:4326") %>%
       addProviderTiles("CartoDB.Positron", options= providerTileOptions(opacity = 0.99)) %>%
@@ -678,7 +258,7 @@ server <- function(input, output, session) {
       ) %>%
       addLegend("bottomright", 
                 pal = pal, 
-                values = c(0,max(selected_county$Daily_new)),
+                values = c(0,3000),
                 title = "New Cases",
                 opacity = 1,
                 labFormat = mylabelFormat(legend),
@@ -692,8 +272,7 @@ server <- function(input, output, session) {
                   fillColor = ~ pal2(Flag),
                   #opacity = 0.5,
                   group = "Potential Alerts",
-                  fillOpacity = 0.6) %>% 
-      # the opacity feature is not working and idk why
+                  fillOpacity = 0.9) %>% 
       addLegend("bottomright", 
                 pal = pal2, 
                 values = ohio.county$Flag,
@@ -703,41 +282,118 @@ server <- function(input, output, session) {
       addLayersControl(overlayGroups = c("Potential Alerts","Daily Cases"),
                        options = layersControlOptions((collapsed = FALSE))) %>%
       hideGroup("Potential Alerts") #%>%
-      #setView(lng = gCentroid(OH_map_db())$x, lat = gCentroid(OH_map_db())$y, zoom = zoom)
-    
-
-    #ggplot(OH_map_db(), aes(fill = Count)) +
-    #      geom_sf()+
-    #      scale_fill_distiller(name="Daily New Cases",
-    #                           limits=c(0,max(selected_county$Daily_new)),
-    #                           palette='Reds',
-    #                           direction=1)
+    #setView(lng = gCentroid(OH_map_db())$x, lat = gCentroid(OH_map_db())$y, zoom = zoom)
   })
   
+  
+  # ----- Region number or County names depend on "run" button
+  aggregation_variable <- eventReactive(input$run_RR + 1, {
+    input$AggregateVariable
+  })
+  
+  aggregation_level_state <- eventReactive(input$run_RR + 1, {
+    readr::parse_character(input$AggregateLevel_state)
+  })
+  
+  aggregation_level_zone <- eventReactive(input$run_RR + 1, {
+    as.numeric(input$AggregateLevel_zone)
+  })
+  
+  aggregation_level_region <- eventReactive(input$run_RR + 1, {
+    as.numeric(input$AggregateLevel_region)
+  })
+  
+  focus_county_level <- eventReactive(input$run_RR + 1, {
+    input$View
+  })
+  
+  
   output$modelPlot = renderPlot({
-    req(input$AggregateVariable)
-    req(input$AggregateLevel)
+    av <- aggregation_variable()
+    if (av == "State") {
+      region <- aggregation_level_state()
+    } else if (av == "Zone") {
+      region <- aggregation_level_zone()
+    } else if (av == "Region") {
+      region <- aggregation_level_region()
+    }
+    
     ggplot.local.trend(data,
                        #aggregation.variable = "State",
                        #aggregation.level = "OH",
-                       aggregation.variable = input$AggregateVariable,
-                       aggregation.level = input$AggregateLevel,
+                       aggregation.variable = av,
+                       aggregation.level = region,
                        focus.variable = "County",
-                       focus.levels = input$View,
+                       focus.levels = focus_county_level(),
                        log.scale = as.logical(input$LogScale),
                        rel.risk = as.logical(input$RelRisk),
                        leave.focus.out = as.logical(input$LeaveFocusOut),
                        confint = as.logical(input$confint))
   })
-
   
-  #output$CensusPlot <- renderPlot({
-  #  ggplot(census_plot_db(), aes(x=Date,y=Count,group=1))+
-  #    geom_line()+
-  #    geom_point()
-  #})
-}
+  
+  reactive_zone <- eventReactive(input$AggregateLevel_zone, {
+    zone_num <- as.numeric(input$AggregateLevel_zone)
+    county_df <- county_data %>% 
+      filter(Zone %in% zone_num)
+    subset(df,NAME %in% county_df$NAME)
+  })
+  reactive_region <- eventReactive(input$AggregateLevel_region, {
+    region_num <- as.numeric(input$AggregateLevel_region)
+    county_df <- county_data %>% 
+      filter(Region %in% region_num)
+    subset(df,NAME %in% county_df$NAME)
+  })
+  
+  
+  observe({
+    av <- input$AggregateVariable
+    if (av == "State"){
+      updateSelectizeInput(session,"View",
+                           choices =unique(county_data$County), 
+                           selected="Franklin") 
+      leafletProxy("OHmap")%>% 
+        clearGroup("highlighted_polygon")
+    }
+    else if (av == "Zone"){
 
+      #zone_num <- as.numeric(input$AggregateLevel)
+      #county_df <- county_data %>% 
+      #  filter(Zone %in% zone_num)
+      #ohio_RR_map_sf_highligh <- subset(df, NAME %in% county_df$NAME)
+      
+      leafletProxy("OHmap") %>% 
+        clearGroup("highlighted_polygon") %>%
+        addPolylines(data = reactive_zone(),
+                     stroke=TRUE, 
+                     weight = 2,
+                     color="black",
+                     group="highlighted_polygon")
+      updateSelectizeInput(session,"View",
+                           choices =unique(reactive_zone()$NAME), 
+                           selected=reactive_zone()$NAME[1])   
+      }
+    
+    else if (av == "Region"){
+      #region_num <- as.numeric(input$AggregateLevel)
+      #county_df <- county_data %>%
+      #  filter(Region %in% region_num)
+      #ohio_RR_map_sf_highligh <- subset(df, NAME %in% county_df$NAME)
+      
+      leafletProxy("OHmap") %>% 
+        clearGroup("highlighted_polygon") %>%
+        addPolylines(data = reactive_region(),
+                     stroke=TRUE, 
+                     weight = 2,
+                     color="black",
+                     group="highlighted_polygon")
+      updateSelectizeInput(session,"View",
+                           choices =unique(reactive_region()$NAME), 
+                           selected=reactive_region()$NAME[1])
+    }
+  })
+    
+}
 # Run the application 
 shinyApp(ui = ui, server = server)
 
